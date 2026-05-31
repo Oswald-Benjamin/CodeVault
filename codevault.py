@@ -1,525 +1,784 @@
 #!/usr/bin/env python3
 """
-CodeVault — Standalone macOS app.
-Double-click to run, or run from Terminal: python3 codevault.py
+CodeVault — Standalone Local Mac Edition
+A single-file web app for archiving and restoring local folders.
+Runs entirely locally. No server needed.
 
-Stores compressed archives in ~/CodeVault/Archives/
-Excludes: node_modules, .git, .next, dist, build, .venv, vendor, etc.
+Usage: python3 codevault.py
+Then open http://127.0.0.1:5555 in your browser.
 """
 
 import os
-import re
 import sys
 import json
 import shutil
+import hashlib
 import tarfile
-import tempfile
-import webbrowser
 import threading
+import subprocess
+import webbrowser
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 import base64
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ─── Config ───────────────────────────────────────────────────────────────────
 
-HOME = Path.home()
-VAULT_DIR = HOME / "CodeVault"
-ARCHIVES_DIR = VAULT_DIR / "Archives"
-METADATA_FILE = VAULT_DIR / "vault.json"
+HOST = "127.0.0.1"
+PORT = 5555
+USERNAME = "admin"
+PASSWORD = "codevault2026"
+ARCHIVE_DIR = Path.home() / "CodeVault" / "Archives"
+ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+DB_FILE = Path.home() / "CodeVault" / "archives.json"
+DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-EXCLUDES = {
-    "node_modules", ".git", ".next", ".turbo", ".cache",
-    "dist", "build", "coverage", ".venv", "vendor",
-    "__pycache__", ".gradle", ".idea", "DerivedData",
-    ".DS_Store", "tmp", "temp", ".Trash",
+# Directories to exclude from archives (never archive these)
+EXCLUDE_DIRS = {
+    "node_modules", ".git", ".next", "dist", "build", "coverage",
+    ".venv", "venv", "__pycache__", ".cache", ".tox", ".mypy_cache",
+    ".gradle", "vendor", "tmp", ".tmp", ".DS_Store",
+}
+EXCLUDE_FILES = {
+    ".DS_Store", "Thumbs.db", ".env", ".env.local",
 }
 
-PORT = 40041  # Arbitrary high port
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-# Auth
-AUTH_USER = "Cryptosi@protonmail.com"
-AUTH_PASS = "Talent81"
-
-# ── Helpers ─────────────────────────────────────────────────────────────────
-
-VAULT_DIR.mkdir(exist_ok=True)
-ARCHIVES_DIR.mkdir(exist_ok=True)
-
-
-def fmt_bytes(n):
-    for u in ("B", "KB", "MB", "GB", "TB"):
-        if abs(n) < 1024:
-            return f"{n:.1f} {u}"
-        n /= 1024
-    return f"{n:.1f} PB"
-
-
-def calc_size(path):
-    t = 0
-    for e in path.rglob("*"):
-        if any(p in EXCLUDES for p in e.parts):
-            continue
-        if e.is_file():
+def get_dir_size(path):
+    """Get actual byte size of a directory by walking all files.
+    Uses st_size (apparent size) — matches what Finder shows."""
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        # Remove excluded dirs from traversal so we don't descend into them
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+        for f in filenames:
+            if f in EXCLUDE_FILES:
+                continue
+            fp = os.path.join(dirpath, f)
             try:
-                t += e.stat().st_size
-            except OSError:
+                total += os.path.getsize(fp)
+            except (OSError, FileNotFoundError):
                 pass
-    return t
+    return total
 
 
-def count_files(path):
-    c = 0
-    for e in path.rglob("*"):
-        if any(p in EXCLUDES for p in e.parts):
-            continue
-        if e.is_file():
-            c += 1
-    return c
+def human_size(size_bytes):
+    """Convert bytes to human-readable string matching macOS Finder conventions (base-10)."""
+    if size_bytes == 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_index = 0
+    size = float(size_bytes)
+    while size >= 1000 and unit_index < len(units) - 1:
+        size /= 1000
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} B"
+    return f"{size:.1f} {units[unit_index]}"
 
 
-def should_exclude(name):
-    return name in EXCLUDES or name.startswith(".")
+def count_items(path):
+    """Count total files and folders in a directory."""
+    files = 0
+    folders = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+        files += len(f for f in filenames if f not in EXCLUDE_FILES)
+        folders += len(dirnames)
+    return files, folders
 
 
-def load_meta():
-    if METADATA_FILE.exists():
+def load_db():
+    if DB_FILE.exists():
         try:
-            return json.loads(METADATA_FILE.read_text())
+            return json.loads(DB_FILE.read_text())
         except Exception:
             return []
     return []
 
 
-def save_meta(data):
-    METADATA_FILE.write_text(json.dumps(data, indent=2))
+def save_db(data):
+    DB_FILE.write_text(json.dumps(data, indent=2))
 
 
-def create_archive(source_path):
-    """Create a .tar.gz archive, excluding heavy directories."""
-    name = source_path.name
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    archive_name = f"{name}-{ts}.tar.gz"
-    archive_path = ARCHIVES_DIR / archive_name
+def encrypt_name(name):
+    return hashlib.sha256(name.encode()).hexdigest()[:16]
 
-    orig_size = calc_size(source_path)
-    file_count = count_files(source_path)
 
-    def filter_func(tarinfo):
-        parts = Path(tarinfo.name).parts
-        if any(p in EXCLUDES for p in parts):
-            return None
-        return tarinfo
+def create_archive(src_path):
+    """Create a tar.gz archive with smart exclusions. Returns (archive_path, original_size_bytes)."""
+    src_path = Path(src_path).resolve()
+    if not src_path.exists():
+        return None, 0
+
+    name = src_path.name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = name.replace(" ", "_").replace("/", "_")
+    archive_name = f"{safe_name}_{timestamp}.tar.gz"
+    archive_path = ARCHIVE_DIR / archive_name
+
+    # Measure original folder size BEFORE archiving (including everything)
+    original_size = get_dir_size(str(src_path))
+
+    file_count, folder_count = count_items(str(src_path))
 
     with tarfile.open(archive_path, "w:gz") as tar:
-        tar.add(source_path, arcname=name, filter=filter_func)
+        for dirpath, dirnames, filenames in os.walk(src_path):
+            # Filter excluded directories in-place so os.walk doesn't descend into them
+            dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+            for filename in filenames:
+                if filename in EXCLUDE_FILES:
+                    continue
+                filepath = Path(dirpath) / filename
+                arcname = filepath.relative_to(src_path.parent)
+                try:
+                    tar.add(filepath, arcname=arcname)
+                except (OSError, FileNotFoundError):
+                    pass
 
-    comp_size = archive_path.stat().st_size
-    saved = orig_size - comp_size
-    pct = round((1 - comp_size / orig_size) * 100, 1) if orig_size > 0 else 0
+    archive_size = archive_path.stat().st_size
+    ratio = ((original_size - archive_size) / original_size * 100) if original_size > 0 else 0
 
-    entry = {
-        "id": ts,
+    record = {
+        "id": encrypt_name(archive_name),
         "name": name,
-        "orig": orig_size,
-        "comp": comp_size,
-        "saved": saved,
-        "pct": pct,
-        "fcount": file_count,
-        "date": datetime.now(timezone.utc).isoformat(),
-        "archiveFile": archive_name,
-        "origPath": str(source_path),
+        "original_path": str(src_path),
+        "archive_file": str(archive_path),
+        "original_size": original_size,       # bytes (uncompressed)
+        "archive_size": archive_size,          # bytes (compressed)
+        "ratio": round(ratio, 1),
+        "file_count": file_count,
+        "folder_count": folder_count,
+        "created_at": timestamp,
     }
 
-    meta = load_meta()
-    meta.insert(0, entry)
-    save_meta(meta)
+    db = load_db()
+    db.insert(0, record)
+    save_db(db)
 
-    return entry
+    return archive_path, original_size
 
 
-def extract_archive(archive_name, dest):
-    """Extract .tar.gz archive to destination."""
-    archive_path = ARCHIVES_DIR / archive_name
-    if not archive_path.exists():
+def restore_archive(archive_id, dest_dir=None):
+    """Restore an archive to dest_dir or original location."""
+    db = load_db()
+    record = next((r for r in db if r["id"] == archive_id), None)
+    if not record:
         return False
-    dest = Path(dest)
+
+    src = Path(record["archive_file"])
+    if not src.exists():
+        return False
+
+    if dest_dir:
+        dest = Path(dest_dir).resolve()
+    else:
+        dest = Path(record["original_path"]).parent / record["name"]
+        # Avoid overwriting — append _restored if exists
+        if dest.exists():
+            dest = dest.parent / f"{record['name']}_restored"
+
     dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive_path, "r:gz") as tar:
-        # Security: prevent path traversal
-        for member in tar.getmembers():
-            member_path = (dest / member.name).resolve()
-            if not str(member_path).startswith(str(dest.resolve())):
-                continue
-            tar.extract(member, path=str(dest))
+
+    with tarfile.open(src, "r:gz") as tar:
+        tar.extractall(dest)
+
     return True
 
 
-# ── Frontend HTML ────────────────────────────────────────────────────────────
+def delete_archive(archive_id):
+    """Delete an archive file and its database record."""
+    db = load_db()
+    record = next((r for r in db if r["id"] == archive_id), None)
+    if not record:
+        return False
 
-PAGE = """<!DOCTYPE html>
+    archive_path = Path(record["archive_file"])
+    if archive_path.exists():
+        archive_path.unlink()
+
+    db = [r for r in db if r["id"] != archive_id]
+    save_db(db)
+    return True
+
+
+def browse_directory(path):
+    """List contents of a directory for the browser dialog."""
+    p = Path(path)
+    if not p.is_dir():
+        return []
+
+    items = []
+    try:
+        for item in sorted(p.iterdir()):
+            try:
+                is_dir = item.is_dir()
+                size = get_dir_size(str(item)) if is_dir else item.stat().st_size
+                items.append({
+                    "name": item.name,
+                    "is_dir": is_dir,
+                    "size": size,
+                    "size_human": human_size(size),
+                })
+            except (PermissionError, OSError):
+                pass
+    except (PermissionError, OSError):
+        pass
+    return items
+
+
+# ─── HTTP Handler ─────────────────────────────────────────────────────────────
+
+class CodeVaultHandler(SimpleHTTPRequestHandler):
+    """Custom handler with Basic Auth and API routing."""
+
+    def _check_auth(self):
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            return False
+        encoded = header[6:]
+        decoded = base64.b64decode(encoded).decode("utf-8", errors="ignore")
+        user, _, pwd = decoded.partition(":")
+        return user == USERNAME and pwd == PASSWORD
+
+    def _send_auth_required(self):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="CodeVault"')
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<h1>401 - Authorisation Required</h1>")
+
+    def _send_json(self, data, status=200):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if not self._check_auth():
+            return self._send_auth_required()
+
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        if path == "/":
+            return self._serve_index()
+        elif path == "/api/archives":
+            db = load_db()
+            return self._send_json([{
+                "id": r["id"],
+                "name": r["name"],
+                "original_size_human": human_size(r["original_size"]),
+                "original_size_bytes": r["original_size"],
+                "archive_size_human": human_size(r["archive_size"]),
+                "archive_size_bytes": r["archive_size"],
+                "ratio": r["ratio"],
+                "file_count": r.get("file_count", 0),
+                "folder_count": r.get("folder_count", 0),
+                "created_at": r["created_at"],
+            } for r in db])
+        elif path == "/api/browse":
+            qs = parse_qs(parsed.query)
+            dirpath = unquote(qs.get("p", ["/"])[0])
+            if not os.path.isdir(dirpath):
+                return self._send_json([])
+            items = browse_directory(dirpath)
+            parent = str(Path(dirpath).parent) if dirpath != "/" else ""
+            return self._send_json({"parent": parent, "current": dirpath, "items": items})
+        elif path == "/api/stats":
+            db = load_db()
+            archives_total_original = sum(r["original_size"] for r in db)
+            archives_total_compressed = sum(r["archive_size"] for r in db)
+            savings = archives_total_original - archives_total_compressed
+            return self._send_json({
+                "total_archives": len(db),
+                "total_original": human_size(archives_total_original),
+                "total_original_bytes": archives_total_original,
+                "total_compressed": human_size(archives_total_compressed),
+                "total_compressed_bytes": archives_total_compressed,
+                "total_savings": human_size(savings),
+                "total_savings_bytes": savings,
+                "archive_dir": str(ARCHIVE_DIR),
+            })
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if not self._check_auth():
+            return self._send_auth_required()
+
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        if path == "/api/archive":
+            src = data.get("path", "").strip()
+            if not src or not os.path.isdir(src):
+                return self._send_json({"error": "Invalid path"}, 400)
+
+            def do_archive():
+                create_archive(src)
+
+            threading.Thread(target=do_archive, daemon=True).start()
+            return self._send_json({"status": "archiving", "path": src})
+
+    def do_DELETE(self):
+        if not self._check_auth():
+            return self._send_auth_required()
+
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+
+        if path.startswith("/api/archive/"):
+            archive_id = path[len("/api/archive/"):]
+            success = delete_archive(archive_id)
+            return self._send_json({"success": success})
+
+    def do_PUT(self):
+        if not self._check_auth():
+            return self._send_auth_required()
+
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        if path.startswith("/api/restore/"):
+            archive_id = path[len("/api/restore/"):]
+            dest = data.get("dest")
+            success = restore_archive(archive_id, dest)
+            return self._send_json({"success": success})
+
+    def _serve_index(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(HTML_PAGE.encode())
+
+    def log_message(self, format, *args):
+        """Silence default logging."""
+        pass
+
+
+# ─── HTML Frontend ────────────────────────────────────────────────────────────
+
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CodeVault</title>
 <style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0d1117;--surface:#161b22;--surface-h:#1c2333;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--orange:#d29922;--red:#f85149;--purple:#bc8cff;--r:8px}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text)}
-.app{display:flex;min-height:100vh}
-.sidebar{width:260px;min-width:260px;background:var(--surface);border-right:1px solid var(--border);padding:20px;display:flex;flex-direction:column;gap:14px;position:sticky;top:0;height:100vh;overflow-y:auto}
-.logo{display:flex;align-items:center;gap:10px}
-.logo-icon{width:36px;height:36px;background:linear-gradient(135deg,#58a6ff,#bc8cff);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px}
-.logo h1{font-size:17px;font-weight:700}
-.sc{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);padding:12px}
-.sc .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);margin-bottom:3px}
-.sc .val{font-size:22px;font-weight:700}
-.sc .val.g{color:var(--green)}.sc .val.b{color:var(--accent)}.sc .val.o{color:var(--orange)}.sc .val.p{color:var(--purple)}
-.sinfo{font-size:11px;color:var(--dim);margin-top:auto;padding-top:12px;border-top:1px solid var(--border)}
-.main{padding:28px;flex:1;max-width:820px}
-.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
-.hdr h2{font-size:20px;font-weight:600}
-.btn{display:inline-flex;align-items:center;gap:5px;padding:7px 13px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface);color:var(--text);font-size:12px;font-weight:500;cursor:pointer;transition:all .15s}
-.btn:hover{background:var(--surface-h)}
-.btn-prim{background:var(--accent);color:#000;border-color:var(--accent)}
-.btn-dng{color:var(--red)}.btn-dng:hover{background:rgba(248,81,73,.1)}
-.btn-sm{padding:4px 9px;font-size:11px}
-.btn:disabled{opacity:.4;cursor:not-allowed}
-.btn-explore{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:7px 13px;border-radius:var(--r);font-size:12px;cursor:pointer;width:100%;text-align:left;display:flex;align-items:center;gap:6px}
-.btn-explore:hover{background:var(--surface-h)}
-.sbox{position:relative;margin-bottom:14px}
-.sbox input{width:100%;padding:8px 10px 8px 32px;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-size:13px;outline:none}
-.sbox input:focus{border-color:var(--accent)}
-.sbox .ic{position:absolute;left:9px;top:50%;transform:translateY(-50%);font-size:12px;color:var(--dim)}
-.alist{display:flex;flex-direction:column;gap:7px}
-.acard{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:13px;display:flex;align-items:center;gap:11px}
-.acard:hover{border-color:var(--dim)}
-.aicon{width:40px;height:40px;background:linear-gradient(135deg,rgba(88,166,255,.1),rgba(188,140,255,.1));border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0}
-.ainfo{flex:1;min-width:0}
-.aname{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.cbar{width:100%;height:3px;background:rgba(210,153,34,.2);border-radius:2px;margin-top:5px;overflow:hidden}
-.cbar .f{height:100%;background:var(--green);border-radius:2px;transition:width .3s}
-.ameta{font-size:10px;color:(--dim);margin-top:5px;display:flex;gap:9px;flex-wrap:wrap;align-items:center}
-.badge{display:inline-flex;align-items:center;gap:3px;padding:2px 6px;border-radius:9px;font-size:10px;font-weight:600;background:rgba(63,185,80,.1);color:var(--green)}
-.aacts{display:flex;gap:4px;flex-shrink:0}
-.empty{text-align:center;padding:60px 20px;border:2px dashed var(--border);border-radius:12px}.empty .ei{font-size:40px;margin-bottom:10px}
-.empty h3{font-size:16px;margin-bottom:5px}.empty p{color:var(--dim);font-size:13px}
-.excludes{margin-top:12px;font-size:11px;color:var(--dim)}
-/* modal */
-.moverlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(3px)}
-.moverlay.open{display:flex}
-.modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:500px;max-width:92vw}
-.modal h3{font-size:16px;margin-bottom:8px}
-.modal p{font-size:12px;color:var(--dim);margin-bottom:12px}
-.browser{background:var(--bg);border:1px solid var(--border);border-radius:var(--r);max-height:280px;overflow-y:auto;margin-bottom:12px}
-.bitem{padding:7px 11px;cursor:pointer;display:flex;align-items:center;gap:7px;font-size:12px;border-bottom:1px solid var(--border)}
-.bitem:hover{background:var(--surface-h)}
-.bitem .fi{color:var(--accent)}
-.mactions{display:flex;justify-content:flex-end;gap:7px}
-.path-bar{font-size:11px;color:var(--dim);font-family:'SF Mono',monospace;margin-bottom:7px;word-break:break-all;background:var(--bg);padding:5px 8px;border-radius:var(--r);border:1px solid var(--border)}
-/* drop */
-.dropzone{border:2px dashed var(--border);border-radius:10px;padding:24px;text-align:center;margin-bottom:18px;transition:all .2s;cursor:pointer}
-.dropzone.drag{border-color:var(--accent);background:rgba(88,166,255,.05)}
-.dropzone .di{font-size:28px;margin-bottom:6px}
-.dropzone p{font-size:13px;color:var(--dim)}
-/* status */
-.sbar{position:fixed;bottom:0;left:0;right:0;padding:7px 20px;background:var(--surface);border-top:1px solid var(--border);font-size:11px;color:var(--dim);display:flex;align-items:center;gap:7px;z-index:50}
-.sbar .spin{width:12px;height:12px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite}
-@keyframes sp{to{transform:rotate(360deg)}}
-@media(max-width:680px){.sidebar{display:none}.main{padding:16px}}
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #222633;
+  --border: #2a2e3d;
+  --text: #e4e6f0;
+  --text2: #8b8fa3;
+  --accent: #6c5ce7;
+  --accent2: #a29bfe;
+  --green: #00cec9;
+  --red: #ff6b6b;
+  --orange: #fdcb6e;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+.header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.header h1 {
+  font-size: 20px;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--accent), var(--green));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.header .btn {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 8px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.header .btn:hover { opacity: 0.85; }
+.container { padding: 24px; max-width: 960px; margin: auto; }
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  margin-bottom: 28px;
+}
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+.stat-card .label { font-size: 12px; color: var(--text2); margin-bottom: 6px; }
+.stat-card .value { font-size: 22px; font-weight: 700; }
+.section-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.archive-list { display: flex; flex-direction: column; gap: 8px; }
+.archive-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  transition: border-color 0.15s;
+}
+.archive-card:hover { border-color: var(--accent); }
+.ac-icon {
+  font-size: 28px;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface2);
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+.ac-info { flex: 1; min-width: 0; }
+.ac-name {
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 4px;
+}
+.ac-meta { font-size: 12px; color: var(--text2); }
+.ac-arrow { color: var(--text2); font-size: 16px; margin: 0 4px; }
+.ac-ratio {
+  font-size: 13px;
+  color: var(--green);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.ac-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.ac-actions button {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.ac-actions button:hover { background: var(--border); }
+.ac-actions .btn-del:hover { background: var(--red); color: white; border-color: var(--red); }
+.empty {
+  text-align: center;
+  padding: 48px;
+  color: var(--text2);
+  font-size: 14px;
+}
+/* Modal */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.65);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+.modal-overlay.active { display: flex; }
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: 90%;
+  max-width: 540px;
+  max-height: 70vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.modal-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.modal-header h3 { font-size: 15px; font-weight: 600; }
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--text2);
+  font-size: 20px;
+  cursor: pointer;
+}
+.modal-body { padding: 0; overflow-y: auto; flex: 1; }
+.browse-item {
+  padding: 8px 20px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: background 0.1s;
+}
+.browse-item:hover { background: var(--surface2); }
+.browse-item .icon { font-size: 16px; width: 20px; text-align: center; }
+.browse-item .b-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.browse-item .b-size { color: var(--text2); font-size: 12px; white-space: nowrap; }
+.modal-footer {
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.modal-footer .path {
+  font-size: 12px;
+  color: var(--text2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+.modal-footer button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 7px 18px;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 12px 18px;
+  border-radius: 9px;
+  font-size: 13px;
+  z-index: 200;
+  animation: fadeIn 0.2s;
+}
+.toast.ok { border-color: var(--green); color: var(--green); }
+.toast.err { border-color: var(--red); color: var(--red); }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.spin { animation: spin 1s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
-<div class="app">
-<aside class="sidebar">
-  <div class="logo"><div class="logo-icon">📦</div><h1>CodeVault</h1></div>
-  <div class="sc"><div class="lbl">Archives</div><div class="val" id="sc">0</div></div>
-  <div class="sc"><div class="lbl">Original</div><div class="val o" id="so">—</div></div>
-  <div class="sc"><div class="lbl">Compressed</div><div class="val b" id="sp">—</div></div>
-  <div class="sc"><div class="lbl">Saved</div><div class="val g" id="ss">—</div></div>
-  <div class="sc"><div class="lbl">Avg Reduction</div><div class="val p" id="sr">—</div></div>
-  <div class="sinfo">Local storage:<br><code>~/CodeVault/</code><br><br>Running on localhost</div>
-</aside>
-<main class="main">
-  <div class="hdr"><h2>Archives</h2><button class="btn btn-prim" onclick="openAM()">📁 Archive Folder</button></div>
-
-  <div class="dropzone" id="dz" ondragover="dz.classList.add('drag');event.preventDefault()" ondragleave="dz.classList.remove('drag')" ondrop="handleDrop(event)">
-    <div class="di">📦</div><p>Drag &amp; drop a folder here to archive it</p>
-  </div>
-
-  <div class="sbox"><span class="ic">🔍</span>
-    <input id="q" placeholder="Search archives…" oninput="renderA()">
-  </div>
-  <div id="content"></div>
-</main>
+<div class="header">
+  <h1>🔐 CodeVault</h1>
+  <button class="btn" onclick="openBrowse()">＋ Archive Folder</button>
 </div>
-<div class="sbar" id="sbar" style="display:none"><div class="spin" id="sspin"></div><span id="stxt"></span></div>
-
-<div class="moverlay" id="amod">
+<div class="container">
+  <div id="stats" class="stats-grid"></div>
+  <div class="section-title">Archives</div>
+  <div id="archives" class="archive-list"><div class="empty"><span class="spin">⏳</span> Loading…</div></div>
+</div>
+<!-- Browse Modal -->
+<div id="modal" class="modal-overlay">
   <div class="modal">
-    <h3>📁 Choose Folder</h3>
-    <p>Navigate to a folder to archive. node_modules, .git, .next, etc. are automatically excluded.</p>
-    <div class="path-bar" id="apath">/</div>
-    <div class="browser" id="alist"></div>
-    <div class="mactions">
-      <button class="btn" onclick="closeAM()">Cancel</button>
-      <button class="btn btn-prim" id="abtn" disabled onclick="doArchive()">Archive This Folder</button>
+    <div class="modal-header">
+      <h3>Select a folder to archive</h3>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div id="modalBody" class="modal-body"></div>
+    <div class="modal-footer">
+      <span id="modalPath" class="path"></span>
+      <button onclick="confirmArchive()">Archive This Folder</button>
     </div>
   </div>
 </div>
-
-<div class="moverlay" id="rmod">
-  <div class="modal">
-    <h3>📥 Restore Archive</h3>
-    <p id="rname" style="font-weight:600;margin-bottom:3px"></p>
-    <p>Choose where to extract contents.</p>
-    <div class="path-bar" id="rpath">/</div>
-    <div class="browser" id="rlist"></div>
-    <div class="mactions">
-      <button class="btn" onclick="closeRM()">Cancel</button>
-      <button class="btn btn-prim" id="rbtn" disabled onclick="doRestore()">Restore Here</button>
-    </div>
-  </div>
-</div>
-
 <script>
-let archs=[],curAP="",curRP="",curA=null;
+let selectedPath = '';
 
-function fb(n){const u=["B","KB","MB","GB","TB"];let i=0;while(Math.abs(n)>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(1)+" "+u[i]}
-function ta(iso){const d=Date.now()-new Date(iso).getTime();if(d<6e4)return"just now";if(d<36e5)return Math.floor(d/6e4)+"m ago";if(d<864e5)return Math.floor(d/36e5)+"h ago";return Math.floor(d/864e5)+"d ago"}
-function stat(t,w){const b=document.getElementById("sbar"),s=document.getElementById("sspin"),x=document.getElementById("stxt");b.style.display="flex";s.style.display=w?"block":"none";x.textContent=t;if(!w)setTimeout(()=>b.style.display="none",4000)}
-
-async function api(u,opt={}){const r=await fetch(u,{...opt,headers:{...opt.headers,"Authorization":"Basic "+btoa("Cryptosi@protonmail.com:Talent81")}});return r.json()}
-
-async function loadA(){try{const d=await api("/api/archives");archs=d.archives||[];renderS(d.stats);renderA()}catch(e){console.error(e)}}
-function renderS(s){document.getElementById("sc").textContent=s.totalArchives||0;document.getElementById("so").textContent=s.totalOriginal?fb(s.totalOriginal):"—";document.getElementById("sp").textContent=s.totalCompressed?fb(s.totalCompressed):"—";document.getElementById("ss").textContent=s.totalSaved?fb(s.totalSaved):"—";document.getElementById("sr").textContent=s.totalOriginal>0?Math.round((1-s.totalCompressed/s.totalOriginal)*100)+"%":"—"}
-
-function renderA(){
-  const q=document.getElementById("q").value.toLowerCase(),f=archs.filter(a=>a.name.toLowerCase().includes(q)),c=document.getElementById("content");
-  if(!f.length){c.innerHTML=`<div class="empty"><div class="ei">📦</div><h3>${archs.length?"No matches":"No archives yet"}</h3><p>${archs.length?"Try a different search":"Drop a folder above or click Archive Folder."}</p>${archs.length?"":'<div class="excludes">Excludes: node_modules · .git · .next · dist · build · ·venv · vendor</div>'}</div>`;return}
-  c.innerHTML=f.map(a=>`<div class="acard"><div class="aicon">📦</div><div class="ainfo"><div class="aname">${esc(a.name)}</div><div class="cbar"><div class="f" style="width:${100-(a.pct||0)}%"></div></div><div class="ameta"><span>📄 ${fb(a.orig)}</span><span>→</span><span>📦 ${fb(a.comp)}</span><span class="badge">▼ ${a.pct}%</span><span>🕐 ${ta(a.date)}</span></div></div><div class="aacts"><button class="btn btn-sm" onclick="openRM('${a.id}')" title="Restore">📥</button><button class="btn btn-sm btn-dng" onclick="delA('${a.id}')" title="Delete">🗑</button></div></div>`).join("")
+async function api(url, opts = {}) {
+  const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  return r.json();
 }
-function esc(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML}
 
-// Drag & drop
-async function handleDrop(e){e.preventDefault();document.getElementById("dz").classList.remove("drag");const items=e.dataTransfer.items;for(const item of items){if(item.kind==="file"){const entry=item.webkitGetAsEntry();if(entry&&entry.isDirectory){stat("Archiving…",true);try{const d=await api("/api/archive",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sourcePath:entry.fullPath})});d.success?stat(`Archived ${d.archive.name} — saved ${fb(d.archive.saved)}`):stat("Error");loadA()}catch(e){stat("Error: "+e.message)}}}}}
+function toast(msg, type = 'ok') {
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
 
-// Archive
-async function browseA(p){curAP=p;document.getElementById("apath").textContent=p;document.getElementById("abtn").disabled=false;document.getElementById("alist").innerHTML="Loading…";try{const d=await api("/api/browse?path="+encodeURIComponent(p));let h="";if(d.parent&&d.parent!==d.current)h+=`<div class="bitem" onclick="browseA('${d.parent}')"><span class="fi">⬆️</span> …</div>`;d.dirs.forEach(x=>h+=`<div class="bitem" onclick="browseA('${x.path}')"><span class="fi">📁</span> ${esc(x.name)}</div>`);document.getElementById("alist").innerHTML=h||"Empty"}catch(e){console.error(e)}}
-function openAM(){document.getElementById("amod").classList.add("open");browseA("/Users")}function closeAM(){document.getElementById("amod").classList.remove("open")}
-async function doArchive(){stat("Archiving…",true);closeAM();try{const d=await api("/api/archive",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sourcePath:curAP})});d.success?stat(`Archived ${d.archive.name} — ${d.archive.pct}% saved`):stat("Error");loadA()}catch(e){stat("Error: "+e.message)}}
+async function loadAll() {
+  const [stats, archives] = await Promise.all([
+    api('/api/stats'),
+    api('/api/archives')
+  ]);
+  document.getElementById('stats').innerHTML = `
+    <div class="stat-card"><div class="label">Archives</div><div class="value">${stats.total_archives}</div></div>
+    <div class="stat-card"><div class="label">Original Size</div><div class="value">${stats.total_original}</div></div>
+    <div class="stat-card"><div class="label">Compressed</div><div class="value">${stats.total_compressed}</div></div>
+    <div class="stat-card"><div class="label">Space Saved</div><div class="value" style="color:var(--green)">${stats.total_savings}</div></div>
+  `;
+  const el = document.getElementById('archives');
+  if (!archives.length) {
+    el.innerHTML = '<div class="empty">No archives yet. Click "Archive Folder" to get started.</div>';
+    return;
+  }
+  el.innerHTML = archives.map(a => `
+    <div class="archive-card">
+      <div class="ac-icon">📦</div>
+      <div class="ac-info">
+        <div class="ac-name">${a.name}</div>
+        <div class="ac-meta">${a.file_count || '?'} files · ${a.folder_count || '?'} folders · ${a.created_at}</div>
+      </div>
+      <div style="text-align:right;white-space:nowrap">
+        <div>${a.original_size_human} <span class="ac-arrow">→</span> ${a.archive_size_human}</div>
+        <div class="ac-ratio">▼ ${a.ratio}%</div>
+      </div>
+      <div class="ac-actions">
+        <button onclick="restore('${a.id}')">📥 Restore</button>
+        <button class="btn-del" onclick="removeArc('${a.id}')">🗑 Delete</button>
+      </div>
+    </div>
+  `).join('');
+}
 
-// Restore
-async function browseR(p){curRP=p;document.getElementById("rpath").textContent=p;document.getElementById("rbtn").disabled=false;document.getElementById("rlist").innerHTML="Loading…";try{const d=await api("/api/browse?path="+encodeURIComponent(p));let h="";if(d.parent&&d.parent!==d.current)h+=`<div class="bitem" onclick="browseR('${d.parent}')"><span class="fi">⬆️</span> …</div>`;d.dirs.forEach(x=>h+=`<div class="bitem" onclick="browseR('${x.path}')"><span class="fi">📁</span> ${esc(x.name)}</div>`);document.getElementById("rlist").innerHTML=h||"Empty"}catch(e){console.error(e)}}
-function openRM(id){curA=archs.find(a=>a.id===id);if(!curA)return;document.getElementById("rname").textContent=`${curA.name} — ${fb(curA.comp)}`;document.getElementById("rmod").classList.add("open");browseR("/Users")}function closeRM(){document.getElementById("rmod").classList.remove("open")}
-async function doRestore(){if(!curA)return;stat("Restoring…",true);closeRM();try{const d=await api("/api/restore/"+curA.id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({dest:curRP})});d.success?stat(`Restored ${curA.name}`):stat("Error");loadA()}catch(e){stat("Error: "+e.message)}}
+async function openBrowse() {
+  const startPath = '/';
+  document.getElementById('modal').classList.add('active');
+  await loadBrowse(startPath);
+}
 
-// Delete
-async function delA(id){if(!confirm("Delete permanently?"))return;try{await api("/api/delete/"+id,{method:"DELETE"});stat("Deleted");loadA()}catch(e){stat("Error")}}
+async function loadBrowse(p) {
+  const data = await api('/api/browse?p=' + encodeURIComponent(p));
+  document.getElementById('modalPath').textContent = data.current;
+  selectedPath = data.current;
+  const body = document.getElementById('modalBody');
+  let html = '';
+  if (data.parent && data.parent !== data.current) {
+    html += `<div class="browse-item" onclick="loadBrowse('${data.parent}')"><span class="icon">⬆️</span><span class="b-name">..</span></div>`;
+  }
+  for (const item of data.items) {
+    if (item.is_dir) {
+      html += `<div class="browse-item" onclick="loadBrowse('${data.current}/${item.name}')">
+        <span class="icon">📁</span>
+        <span class="b-name">${item.name}</span>
+        <span class="b-size">${item.size_human}</span>
+      </div>`;
+    } else {
+      html += `<div class="browse-item" style="opacity:0.45">
+        <span class="icon">📄</span>
+        <span class="b-name">${item.name}</span>
+        <span class="b-size">${item.size_human}</span>
+      </div>`;
+    }
+  }
+  body.innerHTML = html;
+}
 
-// Quick-pick common macOS folders
-async function quickPick(p){document.getElementById("amod").classList.add("open");browseA(p)}
+function closeModal() {
+  document.getElementById('modal').classList.remove('active');
+}
 
-loadA();
+function confirmArchive() {
+  if (!selectedPath) return;
+  api('/api/archive', { method: 'POST', body: JSON.stringify({ path: selectedPath }) });
+  closeModal();
+  toast('Archiving ' + selectedPath.split('/').pop() + '…');
+  setTimeout(loadAll, 3000);
+}
+
+function restore(id) {
+  api('/api/restore/' + id, { method: 'PUT', body: JSON.stringify({}) });
+  toast('Restoring archive…');
+}
+
+function removeArc(id) {
+  if (!confirm('Delete this archive permanently?')) return;
+  api('/api/archive/' + id, { method: 'DELETE' });
+  toast('Archive deleted');
+  loadAll();
+}
+
+// Close modal on overlay click
+document.getElementById('modal').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+loadAll();
 </script>
 </body>
-</html>"""
+</html>
+"""
 
-
-# ── HTTP Server ──────────────────────────────────────────────────────────────
-
-class Handler(SimpleHTTPRequestHandler):
-    """Combined static file + API handler."""
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-
-        # Serve frontend
-        if path == "/" or path == "/index.html":
-            self._html(PAGE)
-            return
-
-        # API: list archives
-        if path == "/api/archives":
-            self._api(self._get_archives)
-            return
-
-        # API: browse
-        if path == "/api/browse":
-            self._api(self._browse, parse_qs(parsed.query))
-            return
-
-        self.send_error(404)
-
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/")
-
-        if path == "/api/archive":
-            self._api(self._create_archive)
-            return
-
-        m = re.match(r"^/api/restore/(\w+)$", path)
-        if m:
-            self._api(lambda: self._restore_archive(m.group(1)))
-            return
-
-        self.send_error(404)
-
-    def do_DELETE(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/")
-
-        m = re.match(r"^/api/delete/(\w+)$", path)
-        if m:
-            self._api(lambda: self._delete_archive(m.group(1)))
-            return
-
-        self.send_error(404)
-
-    # ── API handlers ──────────────────────────────────────────────────────
-
-    def _get_archives(self):
-        a = load_meta()
-        return {
-            "archives": a,
-            "stats": {
-                "totalArchives": len(a),
-                "totalOriginal": sum(x["orig"] for x in a),
-                "totalCompressed": sum(x["comp"] for x in a),
-                "totalSaved": sum(x["orig"] - x["comp"] for x in a),
-            },
-        }
-
-    def _browse(self, params):
-        p = Path(params.get("path", [str(HOME)])[0]).expanduser().resolve()
-        if not p.is_dir():
-            return {"dirs": [], "current": str(p)}
-        dirs = []
-        try:
-            for e in sorted(p.iterdir()):
-                if e.is_dir() and not should_exclude(e.name):
-                    dirs.append({"name": e.name, "path": str(e)})
-        except PermissionError:
-            pass
-        return {"dirs": dirs, "current": str(p), "parent": str(p.parent)}
-
-    def _create_archive(self):
-        body = self._body()
-        src = Path(body["sourcePath"]).expanduser().resolve()
-        if not src.is_dir():
-            return {"error": "Not a directory"}, 400
-        entry = create_archive(src)
-        return {"success": True, "archive": entry}
-
-    def _restore_archive(self, aid):
-        body = self._body()
-        dest = Path(body.get("dest", str(HOME))).expanduser().resolve()
-        meta = load_meta()
-        a = next((x for x in meta if x["id"] == aid), None)
-        if not a:
-            return {"error": "Not found"}, 404
-        if extract_archive(a["archiveFile"], dest):
-            return {"success": True}
-        return {"error": "Restore failed"}, 500
-
-    def _delete_archive(self, aid):
-        meta = load_meta()
-        a = next((x for x in meta if x["id"] == aid), None)
-        if not a:
-            return {"error": "Not found"}, 404
-        ap = ARCHIVES_DIR / a["archiveFile"]
-        if ap.exists():
-            ap.unlink()
-        save_meta([x for x in meta if x["id"] != aid])
-        return {"success": True}
-
-    # ── Auth ───────────────────────────────────────────────────────────────
-
-    def _check_auth(self):
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Basic "):
-            try:
-                user, passwd = base64.b64decode(auth[6:]).decode().split(":", 1)
-                if user == AUTH_USER and passwd == AUTH_PASS:
-                    return True
-            except Exception:
-                pass
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="CodeVault"')
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Authentication required")
-        return False
-
-    # ── Helpers ────────────────────────────────────────────────────────────
-
-    def _api(self, handler, *args):
-        if not self._check_auth():
-            return
-        try:
-            result = handler(*args)
-            status = 200
-            if isinstance(result, tuple):
-                result, status = result
-            body = json.dumps(result).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body)
-        except Exception as e:
-            body = json.dumps({"error": str(e)}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body)
-
-    def _html(self, content):
-        if not self._check_auth():
-            return
-        body = content.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _body(self):
-        length = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(length)) if length else {}
-
-    def log_message(self, format, *args):
-        pass  # Suppress log noise
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     print("")
     print("  ╔══════════════════════════════════════╗")
-    print("  ║         CodeVault is running         ║")
-    print("  ╠══════════════════════════════════════╣")
-    print(f"  ║  URL:   http://localhost:{PORT}       ║")
-    print(f"  ║  User:  {AUTH_USER}    ║")
-    print(f"  ║  Pass:  {AUTH_PASS}                  ║")
-    print("  ╠══════════════════════════════════════╣")
-    print("  ║  Archives: ~/CodeVault/Archives/    ║")
-    print("  ║  Quit: Ctrl+C                       ║")
+    print("  ║        🔐  CodeVault v1.0            ║")
+    print("  ║   Standalone Local Mac Edition       ║")
     print("  ╚══════════════════════════════════════╝")
+    print(f"  Archives stored in: {ARCHIVE_DIR}")
+    print(f"  URL: http://{HOST}:{PORT}")
+    print(f"  Login: {USERNAME} / {PASSWORD}")
     print("")
 
-    # Open browser
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    def open_browser():
+        import time
+        time.sleep(0.8)
+        webbrowser.open(f"http://{HOST}:{PORT}")
 
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nCodeVault stopped.")
-        server.server_close()
+    threading.Thread(target=open_browser, daemon=True).start()
+
+    with HTTPServer((HOST, PORT), CodeVaultHandler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n  CodeVault stopped.")
+            sys.exit(0)
 
 
 if __name__ == "__main__":
