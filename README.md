@@ -1,83 +1,68 @@
 # CodeVault
 
-A native macOS app to compress (archive) and restore codebases.
+**Compress idle codebases.** Archive folders into compact `.tar.gz` files with smart exclusions (node_modules, .git, .next, dist, build, .venv, vendor, etc.).
 
-## What it does
+Two versions available:
 
-- Drag & drop any folder to compress it into a compact `.tar.gz` archive
-- Automatically excludes `node_modules`, `.git`, `.next`, `dist`, `build`, `.venv`, `vendor`, etc.
-- Dashboard with stats: original size, compressed size, space saved, compression ratio
-- Restore archives to any location you choose
-- macOS notifications when operations complete
+---
+
+## Option A: Standalone macOS App (recommended)
+
+A single Python file. No install, no dependencies. Runs on your Mac.
+
+### Download
+
+```bash
+curl -O https://raw.githubusercontent.com/Oswald-Benjamin/CodeVault/main/codevault.py
+```
+
+Or clone the repo:
+```bash
+git clone https://github.com/Oswald-Benjamin/CodeVault.git
+cd CodeVault
+```
+
+### Run
+
+```bash
+python3 codevault.py
+```
+
+That's it. It opens a browser tab at `http://localhost:40041` automatically.
+
+**Login:**
+- Username: `Cryptosi@protonmail.com`
+- Password: `Talent81`
+
+### Usage
+
+1. **Drag & drop** a folder onto the drop zone, **or** click "Archive Folder" to browse
+2. Archive appears in the list with stats (original → compressed, % saved)
+3. Click 📥 to restore to any location
+4. Click 🗑 to delete
+
+**Storage:** Archives saved in `~/CodeVault/Archives/`
+
+---
+
+## Option B: Web Version (server)
+
+For the server-hosted version, see `app.py` and `static/index.html`.
+
+```bash
+pip install flask gunicorn
+gunicorn -w 2 -b 0.0.0.0:5000 app:app
+```
+
+---
+
+## Archived
+
+These directories are always excluded:
+
+`node_modules` · `.git` · `.next` · `dist` · `build` · `.venv` · `vendor` · `__pycache__` · `.turbo` · `.cache` · `.gradle` · `.idea` · `DerivedData` · `.DS_Store`
 
 ## Requirements
 
-- macOS 14.0+
-- Xcode 15+
-
-## Setup (2 minutes)
-
-### Option A: Manual Xcode project (recommended)
-
-1. Copy all the `.swift` files to your Mac
-2. Open Xcode → **File → New → Project**
-3. Choose **macOS → App**
-4. Configure:
-   - **Name:** CodeVault
-   - **Interface:** SwiftUI
-   - **Language:** Swift
-   - **Minimum Deployment:** macOS 14.0
-   - Uncheck "Include Tests"
-5. Delete the auto-generated `ContentView.swift` (we provide our own)
-6. Drag all 7 `.swift` files into the project navigator:
-   - `CodeVaultApp.swift`
-   - `CodebaseArchive.swift`
-   - `ArchiveManager.swift`
-   - `ContentView.swift`
-   - `ArchiveListView.swift`
-   - `EmptyStateView.swift`
-   - `RestoreView.swift`
-7. Build and Run: **⌘R**
-
-### Option B: Build from command line
-
-```bash
-cd /path/to/CodeVault
-swift build -c release
-```
-
-## Source Files
-
-| File | Purpose |
-|---|---|
-| `CodeVaultApp.swift` | App entry point |
-| `CodebaseArchive.swift` | Data model — archive metadata & stats |
-| `ArchiveManager.swift` | Core logic — compress, restore, list, delete |
-| `ContentView.swift` | Main dashboard with stats sidebar |
-| `ArchiveListView.swift` | Scrollable list of archives with search |
-| `EmptyStateView.swift` | Drag & drop landing when no archives |
-| `RestoreView.swift` | Sheet for choosing restore destination |
-
-## Storage
-
-Archives are stored locally at:
-```
-~/CodeVault/Archives/
-```
-
-Archive metadata (names, sizes, dates):
-```
-~/CodeVault/vault.json
-```
-
-Multiplied by the exclusions, most codebases shrink 80-95%.
-
-## Excluded from Archives
-
-These directories are always skipped:
-
-`node_modules` · `.git` · `.next` · `.cache` · `.turbo` · `dist` · `build` · `coverage` · `.venv` · `vendor` · `__pycache__` · `.gradle` · `.idea` · `.vscode` · `DerivedData` · `.DS_Store`
-
-## Notifications
-
-The app requests notification permission on first launch. You'll get a macOS notification when an archive or restore operation completes.
+- **macOS:** Python 3.11+ (comes pre-installed on modern macOS)
+- **Server:** Python 3 + Flask + Gunicorn
