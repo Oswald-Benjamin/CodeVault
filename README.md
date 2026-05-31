@@ -1,68 +1,36 @@
 # CodeVault
 
-**Compress idle codebases.** Archive folders into compact `.tar.gz` files with smart exclusions (node_modules, .git, .next, dist, build, .venv, vendor, etc.).
+**Archive. Restore. Simplify.**
 
-Two versions available:
+A lightweight web app for archiving local folders with smart exclusions.
 
----
+## Standalone Mac Edition
 
-## Option A: Standalone macOS App (recommended)
-
-A single Python file. No install, no dependencies. Runs on your Mac.
-
-### Download
+Download one file. Run it. Done.
 
 ```bash
 curl -O https://raw.githubusercontent.com/Oswald-Benjamin/CodeVault/main/codevault.py
-```
-
-Or clone the repo:
-```bash
-git clone https://github.com/Oswald-Benjamin/CodeVault.git
-cd CodeVault
-```
-
-### Run
-
-```bash
 python3 codevault.py
 ```
 
-That's it. It opens a browser tab at `http://localhost:40041` automatically.
+Then open http://127.0.0.1:5555 in your browser.
 
-**Login:**
-- Username: `Cryptosi@protonmail.com`
-- Password: `Talent81`
+**Login:** `admin` / `codevault2026`
 
-### Usage
+### What it does
+- Browse your Mac's folders and select any to archive
+- Automatically excludes heavy directories (node_modules, .git, build, etc.)
+- Shows compression ratio and space saved
+- Restore archives to any location
+- Dark-themed UI, password protected
+- Stores archives in `~/CodeVault/Archives/`
 
-1. **Drag & drop** a folder onto the drop zone, **or** click "Archive Folder" to browse
-2. Archive appears in the list with stats (original → compressed, % saved)
-3. Click 📥 to restore to any location
-4. Click 🗑 to delete
+### System Requirements
+- macOS (or any OS with Python 3)
+- Python 3.6+ (built into macOS)
+- ~20 MB disk space for the script + archives
+- No additional packages needed — uses only the standard library
 
-**Storage:** Archives saved in `~/CodeVault/Archives/`
-
----
-
-## Option B: Web Version (server)
-
-For the server-hosted version, see `app.py` and `static/index.html`.
-
-```bash
-pip install flask gunicorn
-gunicorn -w 2 -b 0.0.0.0:5000 app:app
-```
-
----
-
-## Archived
-
-These directories are always excluded:
-
-`node_modules` · `.git` · `.next` · `dist` · `build` · `.venv` · `vendor` · `__pycache__` · `.turbo` · `.cache` · `.gradle` · `.idea` · `DerivedData` · `.DS_Store`
-
-## Requirements
-
-- **macOS:** Python 3.11+ (comes pre-installed on modern macOS)
-- **Server:** Python 3 + Flask + Gunicorn
+### Smart Exclusions
+The following directories are automatically skipped when creating archives:
+`node_modules`, `.git`, `.next`, `dist`, `build`, `coverage`, `__pycache__`, `.venv`, `venv`, `vendor`, `.cache`, `tmp`
