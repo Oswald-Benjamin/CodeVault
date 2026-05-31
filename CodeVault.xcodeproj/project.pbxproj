@@ -1,0 +1,99 @@
+{
+  "archiveVersion": 1,
+  "classes": {},
+  "objectVersion": 77,
+  "objects": {
+    "root": {
+      "isa": "PBXProject",
+      "buildConfigurationList": "configList",
+      "compatibilityVersion": "Xcode 15.0",
+      "developmentRegion": "en",
+      "hasScannedForEncodings": 0,
+      "knownRegions": ["en", "Base"],
+      "mainGroup": "mainGroup",
+      "productRefGroup": "products",
+      "projectDirPath": "",
+      "projectRoot": "",
+      "targets": ["target"]
+    },
+    "configList": {
+      "isa": "XCConfigurationList",
+      "buildConfigurations": ["debug", "release"],
+      "defaultConfigurationIsVisible": 0,
+      "defaultConfigurationName": "Release"
+    },
+    "debug": {
+      "isa": "XCBuildConfiguration",
+      "buildSettings": {
+        "SWIFT_VERSION": "5.9",
+        "MACOSX_DEPLOYMENT_TARGET": "14.0",
+        "PRODUCT_BUNDLE_IDENTIFIER": "com.codevault.app",
+        "PRODUCT_NAME": "CodeVault",
+        "CODE_SIGN_STYLE": "Automatic",
+        "ENABLE_HARDENED_RUNTIME": "YES"
+      },
+      "name": "Debug"
+    },
+    "release": {
+      "isa": "XCBuildConfiguration",
+      "buildSettings": {
+        "SWIFT_VERSION": "5.9",
+        "MACOSX_DEPLOYMENT_TARGET": "14.0",
+        "PRODUCT_BUNDLE_IDENTIFIER": "com.codevault.app",
+        "PRODUCT_NAME": "CodeVault",
+        "CODE_SIGN_STYLE": "Automatic",
+        "ENABLE_HARDENED_RUNTIME": "YES"
+      },
+      "name": "Release"
+    },
+    "mainGroup": {
+      "isa": "PBXGroup",
+      "children": ["CodeVault"],
+      "sourceTree": "<group>"
+    },
+    "CodeVault": {
+      "isa": "PBXGroup",
+      "children": [
+        "CodeVaultApp.swift",
+        "CodebaseArchive.swift",
+        "ArchiveManager.swift",
+        "ContentView.swift",
+        "ArchiveListView.swift",
+        "EmptyStateView.swift",
+        "RestoreView.swift"
+      ],
+      "path": "CodeVault",
+      "sourceTree": "<group>"
+    },
+    "products": {
+      "isa": "PBXGroup",
+      "children": ["CodeVault.app"],
+      "name": "Products",
+      "sourceTree": "<group>"
+    },
+    "CodeVault.app": {
+      "isa": "PBXFileReference",
+      "explicitFileType": "wrapper.application",
+      "includeInIndex": 0,
+      "path": "CodeVault.app",
+      "sourceTree": "BUILT_PRODUCTS_DIR"
+    },
+    "target": {
+      "isa": "PBXNativeTarget",
+      "buildConfigurationList": "configList",
+      "buildPhases": ["compile"],
+      "buildRules": [],
+      "dependencies": [],
+      "name": "CodeVault",
+      "productName": "CodeVault",
+      "productReference": "CodeVault.app",
+      "productType": "com.apple.product-type.application"
+    },
+    "compile": {
+      "isa": "PBXSourcesBuildPhase",
+      "buildActionMask": 2147483647,
+      "files": [],
+      "runOnlyForDeploymentPostprocessing": 0
+    }
+  }
+}
